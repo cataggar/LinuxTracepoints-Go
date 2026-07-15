@@ -108,6 +108,9 @@ func TestZeroRegistration(t *testing.T) {
 	t.Parallel()
 
 	var registration Registration
+	if !registration.Closed() {
+		t.Fatal("zero Registration is open")
+	}
 	if registration.Enabled() {
 		t.Fatal("zero Registration is enabled")
 	}

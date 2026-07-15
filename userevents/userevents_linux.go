@@ -270,6 +270,16 @@ func (r *Registration) WriteIndex() uint32 {
 	return r.writeIndex
 }
 
+// Closed reports whether the registration is unavailable for writes.
+func (r *Registration) Closed() bool {
+	if r == nil {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return !r.ready || r.closed
+}
+
 // Enabled reports whether a collector currently enables this tracepoint.
 func (r *Registration) Enabled() bool {
 	if r == nil {
