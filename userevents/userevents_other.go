@@ -53,6 +53,11 @@ func (*Registration) WriteIndex() uint32 {
 	return 0
 }
 
+// Closed reports true on non-Linux platforms.
+func (*Registration) Closed() bool {
+	return true
+}
+
 // Enabled reports false on non-Linux platforms.
 func (*Registration) Enabled() bool {
 	return false
