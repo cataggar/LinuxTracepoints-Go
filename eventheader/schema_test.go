@@ -407,9 +407,23 @@ func TestEventGoldenActivityWrongSchemaAndDisabled(t *testing.T) {
 	if err := event.Write(nil, nil, &related); !errors.Is(err, userevents.ErrDisabled) {
 		t.Fatalf("disabled error = %v, want ErrDisabled before validation", err)
 	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if err := event.Write(nil, nil, nil); !errors.Is(err, userevents.ErrDisabled) {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("disabled state-only Write allocations = %v, want 0", allocations)
+	}
 	registration.closedFlag.Store(true)
 	if err := event.Write(&binding, nil, nil); !errors.Is(err, userevents.ErrClosed) {
 		t.Fatalf("closed error = %v", err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if err := event.Write(nil, nil, nil); !errors.Is(err, userevents.ErrClosed) {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("closed state-only Write allocations = %v, want 0", allocations)
 	}
 }
 

@@ -1,0 +1,3 @@
+package testcollisions_test
+
+var ExternalTestEventSchema int
