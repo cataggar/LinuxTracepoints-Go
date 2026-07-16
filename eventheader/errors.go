@@ -9,8 +9,8 @@ var (
 	ErrInvalidLevel = errors.New("eventheader: invalid level")
 	// ErrInvalidValue indicates an invalid enum, count, activity, or field value.
 	ErrInvalidValue = errors.New("eventheader: invalid value")
-	// ErrState indicates an incomplete event or invalid builder operation order.
-	ErrState = errors.New("eventheader: invalid builder state")
+	// ErrState indicates an incomplete event or invalid builder/binding state.
+	ErrState = errors.New("eventheader: invalid state")
 	// ErrCountTooLarge indicates a count that cannot fit in the 16-bit wire field.
 	ErrCountTooLarge = errors.New("eventheader: count exceeds 65535")
 	// ErrMetadataTooLarge indicates metadata that cannot fit in its extension.

@@ -15,25 +15,63 @@ The producer packages create userspace tracepoints through the Linux
 `user_events` ABI. They do not create in-kernel tracepoints declared with
 `DECLARE_TRACE` or `DEFINE_TRACE`.
 
-Phase 2 adds canonical EventHeader tracepoint naming, dynamic wire encoding,
-activity IDs, fields, arrays, structures, and an `EventSet` bound to an existing
-`userevents.File`. Provider caching, generated typed writers, decoding, and
-collection are future work.
+EventHeader supports provider-owned registration caches, immutable reusable
+schemas, goroutine-local bindings, and dynamic runtime schemas.
+
+## Reusable schemas
+
+Use a `Provider`, `Schema`, and one `Binding` per goroutine when an event schema
+is known in advance:
 
 ```go
-file, err := userevents.Open()
+provider, err := eventheader.OpenProvider("ExampleProvider")
 if err != nil {
 	log.Fatal(err)
 }
-defer file.Close()
+defer provider.Close()
 
-set, err := eventheader.NewEventSet(
-	file, "ExampleProvider", eventheader.LevelInformation, 0x1, "")
+set, err := provider.EventSet(eventheader.LevelInformation, 0x1, "")
 if err != nil {
 	log.Fatal(err)
 }
-defer set.Close()
 
+schema, err := eventheader.NewSchema(
+	eventheader.SchemaOptions{Name: "Request"},
+	eventheader.Uint32Field("status"),
+	eventheader.StringField("path"),
+)
+if err != nil {
+	log.Fatal(err)
+}
+event, err := eventheader.NewEvent(set, schema)
+if err != nil {
+	log.Fatal(err)
+}
+binding := event.Bind(make([]byte, 0, 128))
+
+if event.Enabled() {
+	binding.Reset()
+	if err := binding.Uint32(200); err != nil {
+		log.Fatal(err)
+	}
+	if err := binding.String("/health"); err != nil {
+		log.Fatal(err)
+	}
+	if err := event.Write(&binding, nil, nil); err != nil &&
+		!errors.Is(err, userevents.ErrDisabled) {
+		log.Printf("write tracepoint: %v", err)
+	}
+}
+```
+
+`NewProvider` can instead borrow an existing `userevents.File`. Immutable
+schemas and events may be shared; each goroutine uses its own reusable binding.
+
+## Dynamic schemas
+
+`Builder` remains available when fields are selected at runtime:
+
+```go
 if set.Enabled() {
 	builder, err := eventheader.NewBuilder("Request")
 	if err != nil {

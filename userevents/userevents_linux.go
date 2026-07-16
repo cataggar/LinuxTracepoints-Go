@@ -52,31 +52,62 @@ const (
 	fileClosed
 )
 
+type registrationState uint64
+
+// The low two lifecycle bits hold registrationState; the remaining bits count
+// active operations.
+const (
+	registrationZero registrationState = iota
+	registrationOpen
+	registrationClosing
+	registrationClosed
+
+	registrationStateMask uint64 = 3
+	registrationActiveOne uint64 = 1 << 2
+)
+
+type registrationOperations struct {
+	writev     func(int, [][]byte) (int, error)
+	unregister func(int, []byte) error
+	munmap     func([]byte) error
+}
+
+var systemRegistrationOperations = registrationOperations{
+	writev:     unix.Writev,
+	unregister: unregister,
+	munmap:     unix.Munmap,
+}
+
 // File owns an open user_events_data descriptor and its registrations.
 //
 // The zero value is not usable. Create a File with Open or OpenPath.
 type File struct {
-	mu    sync.Mutex
-	fd    int
-	path  string
-	ready bool
-	state fileState
-	regs  map[*Registration]struct{}
+	mu          sync.Mutex
+	closeCond   sync.Cond
+	closeFD     func(int) error
+	onCloseWait func()
+	fd          int
+	path        string
+	ready       bool
+	state       fileState
+	regs        map[*Registration]struct{}
 }
 
 // Registration is a registered userspace tracepoint.
 //
 // A Registration supports concurrent Enabled, Write, Writev, and Close calls.
 type Registration struct {
-	mu         sync.RWMutex
+	lifecycle  atomic.Uint64
+	closeMu    sync.Mutex
+	closeCond  sync.Cond
 	file       *File
+	ops        *registrationOperations
 	fd         int
 	name       string
 	options    RegisterOptions
 	writeIndex uint32
 	enable     []byte
-	ready      bool
-	closed     bool
+	onClosing  func()
 }
 
 // Open locates and opens the system user_events_data file.
@@ -101,13 +132,16 @@ func OpenPath(path string) (*File, error) {
 }
 
 func newFile(fd int, path string) *File {
-	return &File{
-		fd:    fd,
-		path:  path,
-		ready: true,
-		state: fileOpen,
-		regs:  make(map[*Registration]struct{}),
+	file := &File{
+		closeFD: unix.Close,
+		fd:      fd,
+		path:    path,
+		ready:   true,
+		state:   fileOpen,
+		regs:    make(map[*Registration]struct{}),
 	}
+	file.closeCond.L = &file.mu
+	return file
 }
 
 // Path returns the user_events_data path opened by the File.
@@ -152,22 +186,27 @@ func (f *File) Register(name, fields string, options RegisterOptions) (*Registra
 		NameArgs:   uint64(uintptr(unsafe.Pointer(unsafe.SliceData(command)))),
 	}
 	if err := ioctl(f.fd, diagIOCSReg, unsafe.Pointer(&reg)); err != nil {
-		_ = unix.Munmap(enable)
 		runtime.KeepAlive(command)
-		return nil, os.NewSyscallError("ioctl(DIAG_IOCSREG)", err)
+		registerErr := os.NewSyscallError("ioctl(DIAG_IOCSREG)", err)
+		if munmapErr := unix.Munmap(enable); munmapErr != nil {
+			return nil, errors.Join(registerErr, os.NewSyscallError("munmap", munmapErr))
+		}
+		return nil, registerErr
 	}
 	runtime.KeepAlive(command)
 	runtime.KeepAlive(enable)
 
 	registration := &Registration{
 		file:       f,
+		ops:        &systemRegistrationOperations,
 		fd:         f.fd,
 		name:       name,
 		options:    options,
 		writeIndex: reg.WriteIndex,
 		enable:     enable,
-		ready:      true,
 	}
+	registration.closeCond.L = &registration.closeMu
+	registration.lifecycle.Store(uint64(registrationOpen))
 	f.regs[registration] = struct{}{}
 	return registration, nil
 }
@@ -197,6 +236,7 @@ func (f *File) Delete(name string) error {
 //
 // If an unregister operation fails, Close leaves the file open so cleanup can
 // be retried without releasing memory that the kernel might still update.
+// Concurrent Close calls wait for the close in progress.
 func (f *File) Close() error {
 	if f == nil {
 		return ErrClosed
@@ -207,13 +247,15 @@ func (f *File) Close() error {
 		f.mu.Unlock()
 		return ErrClosed
 	}
-	switch f.state {
-	case fileClosed:
+	for f.state == fileClosing {
+		if f.onCloseWait != nil {
+			f.onCloseWait()
+		}
+		f.closeCond.Wait()
+	}
+	if f.state == fileClosed {
 		f.mu.Unlock()
 		return nil
-	case fileClosing:
-		f.mu.Unlock()
-		return fmt.Errorf("%w: close already in progress", ErrClosed)
 	}
 	f.state = fileClosing
 	registrations := make([]*Registration, 0, len(f.regs))
@@ -231,6 +273,7 @@ func (f *File) Close() error {
 	if len(closeErrors) != 0 {
 		f.mu.Lock()
 		f.state = fileOpen
+		f.closeCond.Broadcast()
 		f.mu.Unlock()
 		return errors.Join(closeErrors...)
 	}
@@ -238,10 +281,16 @@ func (f *File) Close() error {
 	f.mu.Lock()
 	fd := f.fd
 	f.fd = -1
-	f.state = fileClosed
 	f.mu.Unlock()
-	if err := unix.Close(fd); err != nil {
-		return os.NewSyscallError("close", err)
+
+	closeErr := f.closeFD(fd)
+
+	f.mu.Lock()
+	f.state = fileClosed
+	f.closeCond.Broadcast()
+	f.mu.Unlock()
+	if closeErr != nil {
+		return os.NewSyscallError("close", closeErr)
 	}
 	return nil
 }
@@ -275,24 +324,46 @@ func (r *Registration) Closed() bool {
 	if r == nil {
 		return true
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return !r.ready || r.closed
+	return registrationState(r.lifecycle.Load()&registrationStateMask) != registrationOpen
 }
 
 // Enabled reports whether a collector currently enables this tracepoint.
 func (r *Registration) Enabled() bool {
-	if r == nil {
+	if r == nil || !r.acquire() {
 		return false
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.ready && !r.closed && r.enabledLocked()
+	enabled := r.enabled()
+	r.release()
+	return enabled
 }
 
-func (r *Registration) enabledLocked() bool {
-	enableWord := (*uint32)(unsafe.Pointer(unsafe.SliceData(r.enable)))
-	return atomic.LoadUint32(enableWord)&1 != 0
+func (r *Registration) acquire() bool {
+	for {
+		state := r.lifecycle.Load()
+		if registrationState(state&registrationStateMask) != registrationOpen {
+			return false
+		}
+		if r.lifecycle.CompareAndSwap(state, state+registrationActiveOne) {
+			return true
+		}
+	}
+}
+
+func (r *Registration) release() {
+	state := r.lifecycle.Add(^uint64(registrationActiveOne - 1))
+	if state == uint64(registrationClosing) {
+		r.closeMu.Lock()
+		r.closeCond.Broadcast()
+		r.closeMu.Unlock()
+	}
+}
+
+func (r *Registration) enabled() bool {
+	enable := r.enable
+	enableWord := (*uint32)(unsafe.Pointer(unsafe.SliceData(enable)))
+	enabled := atomic.LoadUint32(enableWord)&1 != 0
+	runtime.KeepAlive(enable)
+	return enabled
 }
 
 // Write emits one contiguous payload.
@@ -302,16 +373,11 @@ func (r *Registration) Write(payload []byte) error {
 
 // Writev emits payload segments without first concatenating them.
 func (r *Registration) Writev(payloads ...[]byte) error {
-	if r == nil {
+	if r == nil || !r.acquire() {
 		return ErrClosed
 	}
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if !r.ready || r.closed {
-		return ErrClosed
-	}
-	if !r.enabledLocked() {
+	defer r.release()
+	if !r.enabled() {
 		return ErrDisabled
 	}
 
@@ -329,8 +395,7 @@ func (r *Registration) Writev(payloads ...[]byte) error {
 	vectors[0] = index[:]
 	vectors = append(vectors, payloads...)
 
-	written, err := unix.Writev(r.fd, vectors)
-	runtime.KeepAlive(r.enable)
+	written, err := r.ops.writev(r.fd, vectors)
 	runtime.KeepAlive(payloads)
 	if err != nil {
 		if errors.Is(err, unix.EBADF) {
@@ -345,43 +410,71 @@ func (r *Registration) Writev(payloads ...[]byte) error {
 }
 
 // Close unregisters the tracepoint and releases its kernel-visible enable
-// state. It is safe to call Close more than once.
+// state. Concurrent Close calls are serialized, and it is safe to call Close
+// more than once. An unregister failure leaves the registration open so Close
+// can be retried.
 func (r *Registration) Close() error {
 	if r == nil {
 		return ErrClosed
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.ready {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+
+	state := registrationState(r.lifecycle.Load() & registrationStateMask)
+	if state == registrationZero {
 		return ErrClosed
 	}
-	if r.closed {
+	if state == registrationClosed {
 		return nil
 	}
 
-	enableAddress := unsafe.Pointer(unsafe.SliceData(r.enable))
-	unreg := userUnreg{
-		Size:        userUnregSize,
-		DisableAddr: uint64(uintptr(enableAddress)),
-	}
-	if err := ioctl(r.fd, diagIOCSUnreg, unsafe.Pointer(&unreg)); err != nil {
-		runtime.KeepAlive(r.enable)
-		return os.NewSyscallError("ioctl(DIAG_IOCSUNREG)", err)
-	}
-	runtime.KeepAlive(r.enable)
+	if state == registrationOpen {
+		for {
+			lifecycle := r.lifecycle.Load()
+			if r.lifecycle.CompareAndSwap(
+				lifecycle,
+				lifecycle&^registrationStateMask|uint64(registrationClosing),
+			) {
+				break
+			}
+		}
+		if r.onClosing != nil {
+			r.onClosing()
+		}
+		for r.lifecycle.Load() != uint64(registrationClosing) {
+			r.closeCond.Wait()
+		}
 
-	r.closed = true
+		if err := r.ops.unregister(r.fd, r.enable); err != nil {
+			r.lifecycle.Store(uint64(registrationOpen))
+			return os.NewSyscallError("ioctl(DIAG_IOCSUNREG)", err)
+		}
+	}
+
+	enable := r.enable
+	if err := r.ops.munmap(enable); err != nil {
+		return os.NewSyscallError("munmap", err)
+	}
+	r.enable = nil
+
 	r.file.mu.Lock()
 	delete(r.file.regs, r)
 	r.file.mu.Unlock()
 
-	enable := r.enable
-	r.enable = nil
-	if err := unix.Munmap(enable); err != nil {
-		return os.NewSyscallError("munmap", err)
-	}
+	r.lifecycle.Store(uint64(registrationClosed))
 	return nil
+}
+
+func unregister(fd int, enable []byte) error {
+	enableAddress := unsafe.Pointer(unsafe.SliceData(enable))
+	unreg := userUnreg{
+		Size:        userUnregSize,
+		DisableAddr: uint64(uintptr(enableAddress)),
+	}
+	err := ioctl(fd, diagIOCSUnreg, unsafe.Pointer(&unreg))
+	runtime.KeepAlive(enable)
+	return err
 }
 
 func ioctl(fd int, request uintptr, argument unsafe.Pointer) error {

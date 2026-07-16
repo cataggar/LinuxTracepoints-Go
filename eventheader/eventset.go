@@ -2,17 +2,26 @@ package eventheader
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/cataggar/LinuxTracepoints-Go/userevents"
 )
 
+type eventSetRegistration interface {
+	Enabled() bool
+	Closed() bool
+	Writev(...[]byte) error
+	Close() error
+}
+
 // EventSet owns one EventHeader tracepoint registration for a provider, level,
 // keyword, and group. It does not own or close the underlying File.
 type EventSet struct {
-	registration *userevents.Registration
+	registration eventSetRegistration
 	name         string
 	level        Level
 	keyword      uint64
+	closeDone    atomic.Bool
 }
 
 // NewEventSet validates and registers one EventHeader tracepoint.
@@ -62,7 +71,18 @@ func (s *EventSet) Keyword() uint64 {
 
 // Enabled reports whether a collector currently enables this tracepoint.
 func (s *EventSet) Enabled() bool {
-	return s != nil && s.registration != nil && s.registration.Enabled()
+	return s != nil && s.registration != nil && !s.closeDone.Load() && s.registration.Enabled()
+}
+
+func (s *EventSet) closed() bool {
+	return s == nil || s.registration == nil || s.closeDone.Load() || s.registration.Closed()
+}
+
+func (s *EventSet) writev(payloads ...[]byte) error {
+	if s == nil || s.registration == nil {
+		return userevents.ErrClosed
+	}
+	return s.registration.Writev(payloads...)
 }
 
 // Write encodes and emits builder through Registration.Writev. The enabled
@@ -71,10 +91,13 @@ func (s *EventSet) Write(builder *Builder) error {
 	if s == nil || s.registration == nil {
 		return userevents.ErrClosed
 	}
-	if s.registration.Closed() {
+	if s.closed() {
 		return userevents.ErrClosed
 	}
 	if !s.Enabled() {
+		if s.closed() {
+			return userevents.ErrClosed
+		}
 		return userevents.ErrDisabled
 	}
 	if builder == nil {
@@ -92,7 +115,11 @@ func (s *EventSet) Close() error {
 	if s == nil || s.registration == nil {
 		return userevents.ErrClosed
 	}
-	return s.registration.Close()
+	err := s.registration.Close()
+	if err == nil {
+		s.closeDone.Store(true)
+	}
+	return err
 }
 
 // Write emits this builder through set.
