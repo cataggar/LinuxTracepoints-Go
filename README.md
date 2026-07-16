@@ -18,6 +18,62 @@ The producer packages create userspace tracepoints through the Linux
 EventHeader supports provider-owned registration caches, immutable reusable
 schemas, goroutine-local bindings, and dynamic runtime schemas.
 
+The portable decoder packages parse ordinary tracefs formats, EventHeader
+events, and seek- or pipe-mode `perf.data` without depending on the host byte
+order or word size. Live perf-ring collection was evaluated for v0 and is
+deferred; the library does not currently open `perf_event` rings.
+
+## Decode perf.data
+
+`perfdata.Reader` associates perf attributes, tracefs formats, event IDs, and
+clock metadata before returning structured `tracepoint.Record` values:
+
+```go
+file, err := os.Open("perf.data")
+if err != nil {
+	log.Fatal(err)
+}
+defer file.Close()
+
+info, err := file.Stat()
+if err != nil {
+	log.Fatal(err)
+}
+reader, err := perfdata.Open(file, info.Size(), perfdata.Options{})
+if err != nil {
+	log.Fatal(err)
+}
+defer reader.Close()
+
+for {
+	record, err := reader.Next()
+	if errors.Is(err, io.EOF) {
+		break
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	if record.Kind == tracepoint.RecordEvent {
+		log.Printf("%s/%s: %d fields",
+			record.Identity.System,
+			record.Identity.Name,
+			len(record.Event.Fields))
+	}
+}
+```
+
+Use `perfdata.OpenPipe` for a pipe-mode stream. Record and value byte slices
+borrow the reader's reusable buffer until the next call to `Next`; call
+`tracepoint.CloneRecord` to retain a record. Inner tracefs or EventHeader
+damage is returned as `tracepoint.RecordCorrupt` when the enclosing perf record
+boundary is still valid. Broken outer framing and unsupported compressed data
+return errors.
+
+For standalone payloads, use `tracefs.ParseFormat` and `tracefs.Decode` with an
+explicit source byte order and `sizeof(long)`. Use
+`eventheader/decode.Start` for bounded streaming iteration or
+`eventheader/decode.Decode` for a materialized field tree.
+
 ## Generated typed writers
 
 Annotate an event struct and run the generator from `go generate`:
@@ -171,7 +227,8 @@ The example requires imports for
 - Go 1.25 or later.
 
 Non-Linux builds are supported so applications can compile portable code, but
-attempts to register events return an unsupported-platform error.
+attempts to register events return an unsupported-platform error. Decoding is
+portable and available on non-Linux platforms.
 
 ## License
 
