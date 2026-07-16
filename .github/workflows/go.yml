@@ -28,6 +28,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+      - run: go run ../../cmd/eventheader-gen -type=RequestEvent -output=request_eventheader.go -check
+        working-directory: internal/eventheaderfixture
       - run: go vet ./...
 
   cross-platform:
@@ -41,6 +43,8 @@ jobs:
             goarch: arm64
           - goos: linux
             goarch: "386"
+          - goos: aix
+            goarch: ppc64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
