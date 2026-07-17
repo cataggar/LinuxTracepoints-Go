@@ -219,6 +219,32 @@ func TestClosedWriteChecksBeforeNilAndAllocatesNothing(t *testing.T) {
 	}
 }
 
+func TestClosedWriteFuncSkipsFactoryAndAllocatesNothing(t *testing.T) {
+	writer := &RequestEventWriter{event: new(eventheader.Event)}
+	factoryCalled := false
+	factoryErr := errors.New("factory failure")
+	factory := func() (*RequestEvent, error) {
+		factoryCalled = true
+		return nil, factoryErr
+	}
+	var activity, related eventheader.ActivityID
+	if err := writer.WriteFunc(factory, &activity, &related); !errors.Is(err, userevents.ErrClosed) {
+		t.Fatalf("WriteFunc(factory) = %v, want ErrClosed", err)
+	}
+	if factoryCalled {
+		t.Fatal("closed WriteFunc invoked the factory")
+	}
+	allocations := testing.AllocsPerRun(1000, func() {
+		_ = writer.WriteFunc(factory, nil, nil)
+	})
+	if allocations != 0 {
+		t.Fatalf("closed WriteFunc allocations = %v, want 0", allocations)
+	}
+	if factoryCalled {
+		t.Fatal("closed WriteFunc allocation runs invoked the factory")
+	}
+}
+
 func TestGeneratedScratchIsRetained(t *testing.T) {
 	schema, err := RequestEventSchema()
 	if err != nil {

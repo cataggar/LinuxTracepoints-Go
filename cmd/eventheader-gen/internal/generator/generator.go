@@ -730,7 +730,7 @@ func (p *sourcePackage) checkSelectedGeneratedCollisions(typeNames []string) err
 					continue
 				}
 				switch function.Name.Name {
-				case "Enabled", "Event", "Write", "bind":
+				case "Enabled", "Event", "Write", "WriteFunc", "bind":
 					return p.errorf(function.Name.Pos(),
 						"method %s.%s collides with an eventheader-gen generated method",
 						writer, function.Name.Name)
@@ -881,6 +881,10 @@ func (p *sourcePackage) addSyntheticDeclarations(selectedTypes []string) error {
 		}
 		if !methods[writer]["Write"] {
 			fmt.Fprintf(&declarations, "func (w *%s) Write(value *%s, activity, related *%s.ActivityID) error { return nil }\n",
+				writer, name, eventheaderAlias)
+		}
+		if !methods[writer]["WriteFunc"] {
+			fmt.Fprintf(&declarations, "func (w *%s) WriteFunc(value func() (*%s, error), activity, related *%s.ActivityID) error { return nil }\n",
 				writer, name, eventheaderAlias)
 		}
 		if !methods[writer]["bind"] {
@@ -2531,6 +2535,14 @@ func renderEvent(out *strings.Builder, ev event) {
 	out.WriteString("\tif !w.event.Enabled() { return w.event.Write(nil, nil, nil) }\n")
 	out.WriteString("\tif err := w.bind(value); err != nil { return err }\n")
 	out.WriteString("\treturn w.event.Write(&w.binding, activity, related)\n}\n\n")
+	fmt.Fprintf(out, "// WriteFunc constructs, encodes, and emits %s only when enabled.\nfunc (w *%sWriter) WriteFunc(value func() (*%s, error), activity, related *eventheader_gen_eventheader.ActivityID) error {\n", ev.TypeName, ev.TypeName, ev.TypeName)
+	out.WriteString("\tif w == nil || w.event == nil { return eventheader_gen_userevents.ErrClosed }\n")
+	out.WriteString("\treturn w.event.WriteIfEnabled(&w.binding, activity, related, func(*eventheader_gen_eventheader.Binding) error {\n")
+	out.WriteString("\t\tif value == nil { return eventheader_gen_fmt.Errorf(\"event value function: %w\", eventheader_gen_eventheader.ErrInvalidValue) }\n")
+	out.WriteString("\t\teventValue, err := value()\n")
+	out.WriteString("\t\tif err != nil { return err }\n")
+	out.WriteString("\t\treturn w.bind(eventValue)\n")
+	out.WriteString("\t})\n}\n\n")
 	fmt.Fprintf(out, "func (w *%sWriter) bind(value *%s) error {\n", ev.TypeName, ev.TypeName)
 	out.WriteString("\tif value == nil { return eventheader_gen_fmt.Errorf(\"event value: %w\", eventheader_gen_eventheader.ErrInvalidValue) }\n")
 	temp := 0

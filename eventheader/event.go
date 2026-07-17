@@ -52,6 +52,44 @@ func (e *Event) Bind(storage []byte) Binding {
 	return NewBinding(e.schema, storage)
 }
 
+// WriteIfEnabled resets binding and invokes bind only when this event's
+// tracepoint is enabled. It returns ErrDisabled without validating or mutating
+// binding or invoking bind. A callback error may leave binding partially
+// populated; the next enabled call resets it before reuse. Enablement is
+// checked again by Write after the callback to handle collector races.
+func (e *Event) WriteIfEnabled(
+	binding *Binding,
+	activity, related *ActivityID,
+	bind func(*Binding) error,
+) error {
+	if e == nil || e.set == nil || e.set.registration == nil || e.set.closed() {
+		return userevents.ErrClosed
+	}
+	if !e.set.Enabled() {
+		if e.set.closed() {
+			return userevents.ErrClosed
+		}
+		return userevents.ErrDisabled
+	}
+	if related != nil && activity == nil {
+		return fmt.Errorf("%w: related ID requires an activity ID", ErrInvalidValue)
+	}
+	if binding == nil {
+		return fmt.Errorf("%w: nil binding", ErrInvalidValue)
+	}
+	if binding.schema != e.schema {
+		return fmt.Errorf("%w: binding belongs to a different schema", ErrState)
+	}
+	if bind == nil {
+		return fmt.Errorf("%w: nil bind callback", ErrInvalidValue)
+	}
+	binding.Reset()
+	if err := bind(binding); err != nil {
+		return err
+	}
+	return e.Write(binding, activity, related)
+}
+
 // Write emits a complete binding with optional activity correlation IDs.
 func (e *Event) Write(binding *Binding, activity, related *ActivityID) error {
 	if e == nil || e.set == nil || e.set.registration == nil || e.set.closed() {

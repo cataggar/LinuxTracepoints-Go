@@ -78,6 +78,23 @@ func (w *CgoEventWriter) Write(value *CgoEvent, activity, related *eventheader_g
 	return w.event.Write(&w.binding, activity, related)
 }
 
+// WriteFunc constructs, encodes, and emits CgoEvent only when enabled.
+func (w *CgoEventWriter) WriteFunc(value func() (*CgoEvent, error), activity, related *eventheader_gen_eventheader.ActivityID) error {
+	if w == nil || w.event == nil {
+		return eventheader_gen_userevents.ErrClosed
+	}
+	return w.event.WriteIfEnabled(&w.binding, activity, related, func(*eventheader_gen_eventheader.Binding) error {
+		if value == nil {
+			return eventheader_gen_fmt.Errorf("event value function: %w", eventheader_gen_eventheader.ErrInvalidValue)
+		}
+		eventValue, err := value()
+		if err != nil {
+			return err
+		}
+		return w.bind(eventValue)
+	})
+}
+
 func (w *CgoEventWriter) bind(value *CgoEvent) error {
 	if value == nil {
 		return eventheader_gen_fmt.Errorf("event value: %w", eventheader_gen_eventheader.ErrInvalidValue)

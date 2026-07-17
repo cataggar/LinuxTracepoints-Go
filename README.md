@@ -104,10 +104,19 @@ writer, err := NewRequestEventWriter(provider, make([]byte, 0, 256))
 if err != nil {
 	log.Fatal(err)
 }
-if writer.Enabled() {
-	err = writer.Write(&RequestEvent{Status: 200, Path: "/health"}, nil, nil)
+err = writer.WriteFunc(func() (*RequestEvent, error) {
+	return &RequestEvent{Status: 200, Path: "/health"}, nil
+}, nil, nil)
+if err != nil && !errors.Is(err, userevents.ErrDisabled) {
+	log.Printf("write tracepoint: %v", err)
 }
 ```
+
+`Write` checks enablement before reading fields from an already-created value,
+but Go evaluates the value expression before calling the method. Use
+`WriteFunc` when constructing or mapping the event is nontrivial. Its factory
+is skipped while disabled, is invoked at most once when enabled, and may return
+an error.
 
 Use `-check` in CI to report missing or stale output without writing it.
 `-tags` applies build tags while loading the package. Generated files preserve
@@ -133,7 +142,7 @@ unconstrained or have the same effective constraint as the event. Imported
 named primitives are rejected unless the generator explicitly supports their
 stable standard-library semantics.
 
-Writer method names `Enabled`, `Event`, `Write`, and `bind` are reserved.
+Writer method names `Enabled`, `Event`, `Write`, `WriteFunc`, and `bind` are reserved.
 Other methods may extend generated writer types. Collision checks include
 same-package test files and inactive Go files whenever their effective build
 constraints can overlap the generated file; external test packages are
@@ -174,23 +183,21 @@ if err != nil {
 }
 binding := event.Bind(make([]byte, 0, 128))
 
-if event.Enabled() {
-	binding.Reset()
+err = event.WriteIfEnabled(&binding, nil, nil, func(binding *eventheader.Binding) error {
 	if err := binding.Uint32(200); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	if err := binding.String("/health"); err != nil {
-		log.Fatal(err)
-	}
-	if err := event.Write(&binding, nil, nil); err != nil &&
-		!errors.Is(err, userevents.ErrDisabled) {
-		log.Printf("write tracepoint: %v", err)
-	}
+	return binding.String("/health")
+})
+if err != nil && !errors.Is(err, userevents.ErrDisabled) {
+	log.Printf("write tracepoint: %v", err)
 }
 ```
 
 `NewProvider` can instead borrow an existing `userevents.File`. Immutable
 schemas and events may be shared; each goroutine uses its own reusable binding.
+`WriteIfEnabled` resets the binding only after confirming enablement and
+rechecks enablement during the final write to handle collector races.
 This reusable API and the dynamic API below remain available without code
 generation.
 
@@ -216,6 +223,9 @@ if set.Enabled() {
 	}
 }
 ```
+
+Dynamic builders still require the explicit `set.Enabled()` guard because a
+lazy dynamic-builder helper is intentionally outside the scope of issue #8.
 
 The example requires imports for
 `github.com/cataggar/LinuxTracepoints-Go/eventheader`,
