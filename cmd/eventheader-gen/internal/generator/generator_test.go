@@ -1273,6 +1273,7 @@ func TestGeneratedMethodCollisions(t *testing.T) {
 	}{
 		{"methodcollisionmissing", "eventheader_gen.go", "Enabled"},
 		{"methodcollisionstale", "eventheader_gen.go", "bind"},
+		{"methodcollisionwritefunc", "eventheader_gen.go", "WriteFunc"},
 	} {
 		_, err := Generate(Config{
 			Dir:   filepath.Join("testdata", test.dir),

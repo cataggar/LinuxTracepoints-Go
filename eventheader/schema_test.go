@@ -427,6 +427,175 @@ func TestEventGoldenActivityWrongSchemaAndDisabled(t *testing.T) {
 	}
 }
 
+func TestEventWriteIfEnabledGoldenAndReset(t *testing.T) {
+	schema, err := NewSchema(SchemaOptions{
+		Name: "Lazy", ID: 0x1234, Version: 2, Tag: 3, Opcode: OpcodeActivityStart,
+	}, Uint32Field("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := new(fakeRegistration)
+	registration.enabled.Store(true)
+	event := mustNewEvent(t, fakeSet(LevelInformation, 1, "", registration), schema)
+	binding := event.Bind(make([]byte, 0, 4))
+	if err := binding.Uint32(1); err != nil {
+		t.Fatal(err)
+	}
+	var activity, related ActivityID
+	for i := range activity {
+		activity[i], related[i] = byte(i), byte(0xf0+i)
+	}
+	calls := 0
+	err = event.WriteIfEnabled(&binding, &activity, &related, func(value *Binding) error {
+		calls++
+		if value.index != 0 || len(value.payload) != 0 {
+			t.Fatalf("callback received non-reset binding: index=%d payload=%x", value.index, value.payload)
+		}
+		return value.Uint32(0xabcdef01)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("callback calls = %d, want 1", calls)
+	}
+
+	builder, _ := NewBuilder("Lazy")
+	_ = builder.SetIDVersion(0x1234, 2)
+	_ = builder.SetTag(3)
+	_ = builder.SetOpcode(OpcodeActivityStart)
+	_ = builder.SetActivity(&activity, &related)
+	_ = builder.Uint32("value", 0xabcdef01)
+	want, err := builder.Encode(LevelInformation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registration.writes) != 1 || !bytes.Equal(registration.writes[0], want) {
+		t.Fatalf("event wire = %x, want %x", registration.writes, want)
+	}
+}
+
+func TestEventWriteIfEnabledStateAndValidation(t *testing.T) {
+	schema, _ := NewSchema(SchemaOptions{Name: "Lazy"}, Uint32Field("value"))
+	registration := new(fakeRegistration)
+	event := mustNewEvent(t, fakeSet(LevelInformation, 1, "", registration), schema)
+	binding := event.Bind(make([]byte, 0, 4))
+	if err := binding.Uint32(42); err != nil {
+		t.Fatal(err)
+	}
+	beforePayload := append([]byte(nil), binding.payload...)
+	beforeIndex := binding.index
+	var related ActivityID
+	calls := 0
+	callback := func(*Binding) error {
+		calls++
+		return nil
+	}
+
+	if err := event.WriteIfEnabled(&binding, nil, &related, callback); !errors.Is(err, userevents.ErrDisabled) {
+		t.Fatalf("disabled error = %v, want ErrDisabled before validation", err)
+	}
+	if err := event.WriteIfEnabled(nil, nil, nil, nil); !errors.Is(err, userevents.ErrDisabled) {
+		t.Fatalf("disabled nil arguments error = %v, want ErrDisabled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("disabled callback calls = %d, want 0", calls)
+	}
+	if binding.index != beforeIndex || !bytes.Equal(binding.payload, beforePayload) {
+		t.Fatal("disabled call mutated binding")
+	}
+
+	registration.enabled.Store(true)
+	if err := event.WriteIfEnabled(&binding, nil, &related, callback); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("orphan-related error = %v, want ErrInvalidValue", err)
+	}
+	if err := event.WriteIfEnabled(nil, nil, nil, callback); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("nil-binding error = %v, want ErrInvalidValue", err)
+	}
+	other, _ := NewSchema(SchemaOptions{Name: "Other"}, Uint32Field("value"))
+	wrong := other.Bind(nil)
+	if err := event.WriteIfEnabled(&wrong, nil, nil, callback); !errors.Is(err, ErrState) {
+		t.Fatalf("wrong-schema error = %v, want ErrState", err)
+	}
+	if err := event.WriteIfEnabled(&binding, nil, nil, nil); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("nil-callback error = %v, want ErrInvalidValue", err)
+	}
+	if calls != 0 {
+		t.Fatalf("invalid-argument callback calls = %d, want 0", calls)
+	}
+
+	registration.closedFlag.Store(true)
+	if err := event.WriteIfEnabled(&binding, nil, nil, callback); !errors.Is(err, userevents.ErrClosed) {
+		t.Fatalf("closed error = %v, want ErrClosed", err)
+	}
+	if err := event.WriteIfEnabled(nil, nil, &related, nil); !errors.Is(err, userevents.ErrClosed) {
+		t.Fatalf("closed invalid-arguments error = %v, want ErrClosed", err)
+	}
+	if calls != 0 {
+		t.Fatalf("closed callback calls = %d, want 0", calls)
+	}
+	if binding.index != beforeIndex || !bytes.Equal(binding.payload, beforePayload) {
+		t.Fatal("closed call mutated binding")
+	}
+}
+
+func TestEventWriteIfEnabledCallbackErrorsAndRace(t *testing.T) {
+	schema, _ := NewSchema(SchemaOptions{Name: "Lazy"}, Uint32Field("value"))
+	registration := new(fakeRegistration)
+	registration.enabled.Store(true)
+	event := mustNewEvent(t, fakeSet(LevelInformation, 1, "", registration), schema)
+	binding := event.Bind(make([]byte, 0, 4))
+
+	callbackErr := errors.New("callback")
+	if err := event.WriteIfEnabled(&binding, nil, nil, func(value *Binding) error {
+		if err := value.Uint32(1); err != nil {
+			return err
+		}
+		return callbackErr
+	}); !errors.Is(err, callbackErr) {
+		t.Fatalf("callback error = %v, want callback error", err)
+	}
+	if len(registration.writes) != 0 {
+		t.Fatal("callback error recorded a write")
+	}
+
+	if err := event.WriteIfEnabled(&binding, nil, nil, func(*Binding) error {
+		return nil
+	}); !errors.Is(err, ErrState) {
+		t.Fatalf("incomplete-binding error = %v, want ErrState", err)
+	}
+	if len(registration.writes) != 0 {
+		t.Fatal("incomplete binding recorded a write")
+	}
+
+	if err := event.WriteIfEnabled(&binding, nil, nil, func(value *Binding) error {
+		if err := value.Uint32(2); err != nil {
+			return err
+		}
+		registration.enabled.Store(false)
+		return nil
+	}); !errors.Is(err, userevents.ErrDisabled) {
+		t.Fatalf("disable-race error = %v, want ErrDisabled", err)
+	}
+	if len(registration.writes) != 0 {
+		t.Fatal("disable race recorded a write")
+	}
+
+	registration.enabled.Store(true)
+	if err := event.WriteIfEnabled(&binding, nil, nil, func(value *Binding) error {
+		if err := value.Uint32(3); err != nil {
+			return err
+		}
+		registration.closedFlag.Store(true)
+		return nil
+	}); !errors.Is(err, userevents.ErrClosed) {
+		t.Fatalf("close-race error = %v, want ErrClosed", err)
+	}
+	if len(registration.writes) != 0 {
+		t.Fatal("close race recorded a write")
+	}
+}
+
 func TestNewEventValidation(t *testing.T) {
 	schema, err := NewSchema(SchemaOptions{Name: "Event"})
 	if err != nil {
@@ -508,6 +677,21 @@ func TestReusableFixedBindingAndEventAllocations(t *testing.T) {
 	}); got != 0 {
 		t.Fatalf("disabled Event.Write allocations = %v, want 0", got)
 	}
+	calls := 0
+	if got := testing.AllocsPerRun(1000, func() {
+		err := event.WriteIfEnabled(&binding, nil, nil, func(*Binding) error {
+			calls++
+			return nil
+		})
+		if !errors.Is(err, userevents.ErrDisabled) {
+			panic(err)
+		}
+	}); got != 0 {
+		t.Fatalf("disabled Event.WriteIfEnabled allocations = %v, want 0", got)
+	}
+	if calls != 0 {
+		t.Fatalf("disabled Event.WriteIfEnabled callback calls = %d, want 0", calls)
+	}
 }
 
 func BenchmarkReusableFixedBinding(b *testing.B) {
@@ -540,6 +724,19 @@ func BenchmarkEventWriteDisabled(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		_ = event.Write(&binding, nil, nil)
+	}
+}
+
+func BenchmarkEventWriteIfEnabledDisabled(b *testing.B) {
+	schema, _ := NewSchema(SchemaOptions{Name: "Benchmark"}, Uint32Field("value"))
+	event := mustNewEvent(b, fakeSet(LevelInformation, 1, "", new(fakeRegistration)), schema)
+	binding := event.Bind(make([]byte, 0, 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = event.WriteIfEnabled(&binding, nil, nil, func(value *Binding) error {
+			return value.Uint32(42)
+		})
 	}
 }
 
