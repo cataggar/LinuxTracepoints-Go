@@ -80,6 +80,23 @@ func (w *CombinedLinuxAMD64EventWriter) Write(value *CombinedLinuxAMD64Event, ac
 	return w.event.Write(&w.binding, activity, related)
 }
 
+// WriteFunc constructs, encodes, and emits CombinedLinuxAMD64Event only when enabled.
+func (w *CombinedLinuxAMD64EventWriter) WriteFunc(value func() (*CombinedLinuxAMD64Event, error), activity, related *eventheader_gen_eventheader.ActivityID) error {
+	if w == nil || w.event == nil {
+		return eventheader_gen_userevents.ErrClosed
+	}
+	return w.event.WriteIfEnabled(&w.binding, activity, related, func(*eventheader_gen_eventheader.Binding) error {
+		if value == nil {
+			return eventheader_gen_fmt.Errorf("event value function: %w", eventheader_gen_eventheader.ErrInvalidValue)
+		}
+		eventValue, err := value()
+		if err != nil {
+			return err
+		}
+		return w.bind(eventValue)
+	})
+}
+
 func (w *CombinedLinuxAMD64EventWriter) bind(value *CombinedLinuxAMD64Event) error {
 	if value == nil {
 		return eventheader_gen_fmt.Errorf("event value: %w", eventheader_gen_eventheader.ErrInvalidValue)
